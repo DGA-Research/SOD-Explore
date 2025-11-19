@@ -175,12 +175,44 @@ def sidebar_dataset_picker(files: List[FileMeta]) -> Tuple[str, List[FileMeta]]:
         st.sidebar.info(f"No {data_type.lower()} files found in the data folder.")
         return data_type, []
 
-    period_options = {meta.label: meta for meta in filtered}
-    default_selection = [filtered[-1].label] if filtered else []
+    year_groups: Dict[Optional[int], List[FileMeta]] = {}
+    for meta in filtered:
+        year_groups.setdefault(meta.year, []).append(meta)
+
+    def year_label(year: Optional[int]) -> str:
+        return str(year) if year is not None else "Unknown Year"
+
+    def sort_key(year: Optional[int]) -> Tuple[int, int]:
+        # Known years first, ascending; Unknown at the end.
+        return (1 if year is None else 0, year or 0)
+
+    sorted_years = sorted(year_groups.keys(), key=sort_key)
+    label_to_files: Dict[str, List[FileMeta]] = {}
+    option_labels: List[str] = []
+    for year in sorted_years:
+        metas = year_groups[year]
+        label = f"{year_label(year)} ({len(metas)} file{'s' if len(metas) != 1 else ''})"
+        option_labels.append(label)
+        label_to_files[label] = metas
+
+    default_label: Optional[str] = None
+    known_years = [year for year in year_groups if year is not None]
+    if known_years:
+        latest_year = max(known_years)
+        target_label = year_label(latest_year)
+        for label in option_labels:
+            if label.startswith(target_label):
+                default_label = label
+                break
+    elif option_labels:
+        default_label = option_labels[-1]
+
     selected_labels = st.sidebar.multiselect(
-        "Reporting periods", options=list(period_options.keys()), default=default_selection
+        "Reporting years",
+        options=option_labels,
+        default=[default_label] if default_label else option_labels,
     )
-    selected_files = [period_options[label] for label in selected_labels]
+    selected_files = [meta for label in selected_labels for meta in label_to_files.get(label, [])]
 
     st.sidebar.caption("Tip: limit selections if you run into memory constraints.")
     return data_type, selected_files
