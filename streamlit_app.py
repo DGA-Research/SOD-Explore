@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from zipfile import ZipFile
 
 import pandas as pd
 import streamlit as st
@@ -355,6 +356,35 @@ def render_data_preview(df: pd.DataFrame) -> None:
     )
 
 
+def ensure_data_directory(path_str: str) -> Optional[Path]:
+    """Ensure a directory with CSVs exists, extracting from a zip if necessary."""
+
+    path = Path(path_str).expanduser()
+    if path.is_dir():
+        return path
+
+    candidates = []
+    if path.suffix.lower() == ".zip" and path.is_file():
+        candidates.append((path, path.parent / path.stem))
+    else:
+        zip_candidate = path.with_suffix(".zip")
+        if zip_candidate.is_file():
+            candidates.append((zip_candidate, path))
+
+    for zip_path, dest_dir in candidates:
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            with ZipFile(zip_path) as zf:
+                zf.extractall(dest_dir)
+            st.sidebar.success(f"Extracted {zip_path.name} into {dest_dir}")
+            return dest_dir
+        except Exception as exc:  # pragma: no cover - surface to the UI
+            st.sidebar.error(f"Failed to extract {zip_path.name}: {exc}")
+            return None
+
+    return path if path.is_dir() else None
+
+
 def main() -> None:
     st.set_page_config(page_title="SOD Explorer", layout="wide")
     st.title("Statement of Disbursements Explorer")
@@ -363,7 +393,12 @@ def main() -> None:
     data_dir_input = st.sidebar.text_input(
         "SOD data folder", value=str(DEFAULT_DATA_DIR), help="Path containing the raw CSV files."
     )
-    files = discover_files(data_dir_input)
+    data_dir = ensure_data_directory(data_dir_input)
+    if not data_dir:
+        st.error("Unable to locate or extract the data directory. Check the path or zip file.")
+        st.stop()
+
+    files = discover_files(str(data_dir))
 
     if not files:
         st.error("No CSV files detected. Confirm the folder path and retry.")
