@@ -173,7 +173,7 @@ def extract_person_name(value: object) -> Optional[str]:
         return None
 
     # Remove extra descriptors following punctuation.
-    for splitter in (",", " - ", " – ", "("):
+    for splitter in (",", " - ", "\u2013", "("):
         if splitter in text:
             text = text.split(splitter, 1)[0].strip()
 
@@ -221,14 +221,14 @@ def load_data(file_paths: Tuple[str, ...], data_type: str) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
-def sidebar_dataset_picker(files: List[FileMeta]) -> Tuple[str, List[FileMeta]]:
+def sidebar_dataset_picker(files: List[FileMeta]) -> Tuple[str, List[FileMeta], List[int]]:
     st.sidebar.header("Dataset")
 
-    data_type = st.sidebar.selectbox("Data type", options=["Detail", "Summary"])
+    data_type = st.sidebar.selectbox("Data type", options=["Summary", "Detail"], index=0)
     filtered = [meta for meta in files if meta.data_type == data_type]
     if not filtered:
         st.sidebar.info(f"No {data_type.lower()} files found in the data folder.")
-        return data_type, []
+        return data_type, [], []
 
     year_groups: Dict[Optional[int], List[FileMeta]] = {}
     for meta in filtered:
@@ -268,9 +268,17 @@ def sidebar_dataset_picker(files: List[FileMeta]) -> Tuple[str, List[FileMeta]]:
         default=default_selection,
     )
     selected_files = [meta for label in selected_labels for meta in label_to_files.get(label, [])]
+    selected_years = sorted(
+        {
+            meta.year
+            for label in selected_labels
+            for meta in label_to_files.get(label, [])
+            if meta.year is not None
+        }
+    )
 
     st.sidebar.caption("Tip: limit selections if you run into memory constraints.")
-    return data_type, selected_files
+    return data_type, selected_files, selected_years
 
 
 def build_filter_controls(df: pd.DataFrame, data_type: str) -> Dict[str, object]:
@@ -279,6 +287,10 @@ def build_filter_controls(df: pd.DataFrame, data_type: str) -> Dict[str, object]
         return filters
 
     st.sidebar.header("Filters")
+
+    if "PERSON" in df.columns and df["PERSON"].notna().any():
+        person_options = sorted(df["PERSON"].dropna().unique())
+        filters["person"] = st.sidebar.multiselect("Person", options=person_options)
 
     for column_label, filter_key in (
         ("ORGANIZATION", "organization"),
@@ -289,10 +301,6 @@ def build_filter_controls(df: pd.DataFrame, data_type: str) -> Dict[str, object]
         if column_label in df.columns:
             options = sorted(df[column_label].dropna().unique())
             filters[filter_key] = st.sidebar.multiselect(column_label.title(), options=options)
-
-    if "PERSON" in df.columns and df["PERSON"].notna().any():
-        person_options = sorted(df["PERSON"].dropna().unique())
-        filters["person"] = st.sidebar.multiselect("Person", options=person_options)
 
     if data_type == "Detail" and "VENDOR NAME" in df.columns:
         filters["vendor_query"] = st.sidebar.text_input("Vendor contains")
@@ -464,6 +472,51 @@ def render_data_preview(df: pd.DataFrame) -> None:
     )
 
 
+def render_detail_download_sidebar(
+    all_files: List[FileMeta], selected_years: List[int], filters: Dict[str, object]
+) -> None:
+    expander = st.sidebar.expander("Detailed summary download", expanded=False)
+    with expander:
+        if not selected_years:
+            st.info("Select at least one reporting year to enable detailed downloads.")
+            return
+
+        detail_files = [
+            meta for meta in all_files if meta.data_type == "Detail" and meta.year in selected_years
+        ]
+        if not detail_files:
+            st.info("No detail files available for the selected years.")
+            return
+
+        if not st.button("Prepare detailed summary CSV", key="detail_download_prepare"):
+            st.caption("Click to generate a CSV of detail records matching your filters.")
+            return
+
+        detail_paths = tuple(str(meta.path) for meta in detail_files)
+        with st.spinner("Loading detail records…"):
+            detail_df = load_data(detail_paths, "Detail")
+
+        if detail_df.empty:
+            st.info("The selected detail files did not contain any rows.")
+            return
+
+        detail_filters = dict(filters)
+        detail_filters["amount_column"] = "AMOUNT"
+        detail_filtered = apply_filters(detail_df, detail_filters, "Detail")
+        if detail_filtered.empty:
+            st.info("No detail rows match the current filters.")
+            return
+
+        csv_bytes = detail_filtered.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download detailed summary",
+            data=csv_bytes,
+            file_name="sod_detail_filtered.csv",
+            mime="text/csv",
+            key="detail_download_link",
+        )
+
+
 def ensure_data_directory(path_str: str) -> Optional[Path]:
     """Ensure a directory with CSVs exists, extracting from a zip if necessary."""
 
@@ -512,7 +565,7 @@ def main() -> None:
         st.error("No CSV files detected. Confirm the folder path and retry.")
         st.stop()
 
-    data_type, selected_files = sidebar_dataset_picker(files)
+    data_type, selected_files, selected_years = sidebar_dataset_picker(files)
     if not selected_files:
         st.warning("Pick at least one reporting period to begin exploring the data.")
         st.stop()
@@ -535,6 +588,7 @@ def main() -> None:
         render_summary_view(filtered_df, amount_column)
 
     render_data_preview(filtered_df)
+    render_detail_download_sidebar(files, selected_years, filters)
 
 
 if __name__ == "__main__":
