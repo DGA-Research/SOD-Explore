@@ -125,9 +125,10 @@ def _read_csv_with_fallback(csv_path: Path) -> pd.DataFrame:
 
     encodings = ("utf-8", "cp1252", "latin-1")
     last_error: Optional[Exception] = None
+    read_kwargs = {"low_memory": False}
     for encoding in encodings:
         try:
-            return pd.read_csv(csv_path, encoding=encoding)
+            return pd.read_csv(csv_path, encoding=encoding, **read_kwargs)
         except UnicodeDecodeError as exc:
             last_error = exc
             continue
