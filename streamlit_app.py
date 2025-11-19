@@ -133,7 +133,7 @@ def _read_csv_with_fallback(csv_path: Path) -> pd.DataFrame:
     read_kwargs = {"low_memory": False}
     for encoding in encodings:
         try:
-            return pd.read_csv(csv_path, encoding=encoding, **read_kwargs)
+            return pd.read_csv(csv_path, encoding=encoding, encoding_errors="ignore", **read_kwargs)
         except UnicodeDecodeError as exc:
             last_error = exc
             continue
@@ -487,14 +487,7 @@ def stream_filtered_detail_csv(
         if not csv_path.exists():
             continue
 
-        chunk_iter = pd.read_csv(
-            csv_path,
-            encoding="utf-8",
-            low_memory=False,
-            chunksize=chunk_size,
-        )
-
-        for chunk in chunk_iter:
+        for chunk in _iter_csv_chunks(csv_path, chunk_size):
             chunk.columns = [col.strip().upper() for col in chunk.columns]
             chunk["SOURCE_FILE"] = csv_path.name
 
@@ -523,6 +516,32 @@ def stream_filtered_detail_csv(
         raise ValueError("No detail rows match the current filters.")
 
     return output_buffer.getvalue().encode("utf-8")
+
+
+def _iter_csv_chunks(csv_path: Path, chunk_size: int) -> Iterable[pd.DataFrame]:
+    """Yield DataFrame chunks using the same encoding fallback as bulk loading."""
+
+    encodings = ("utf-8", "cp1252", "latin-1")
+    last_error: Optional[Exception] = None
+    for encoding in encodings:
+        try:
+            chunk_iter = pd.read_csv(
+                csv_path,
+                encoding=encoding,
+                encoding_errors="ignore",
+                low_memory=False,
+                chunksize=chunk_size,
+            )
+            for chunk in chunk_iter:
+                yield chunk
+            return
+        except UnicodeDecodeError as exc:
+            last_error = exc
+            continue
+
+    raise last_error or UnicodeDecodeError(
+        "utf-8", b"", 0, 1, f"Failed to decode {csv_path.name} with fallback encodings."
+    )
 
 
 def render_detail_download_sidebar(
