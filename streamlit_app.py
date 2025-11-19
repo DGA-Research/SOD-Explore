@@ -19,6 +19,11 @@ from zipfile import ZipFile
 import pandas as pd
 import streamlit as st
 
+try:
+    import xlsxwriter  # type: ignore
+except ImportError:  # pragma: no cover
+    xlsxwriter = None
+
 # Default location that ships with the repository.
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "SOD_Bulk"
 
@@ -494,16 +499,29 @@ def render_data_preview(df: pd.DataFrame) -> None:
     )
 
 
-def stream_filtered_detail_csv(
-    csv_paths: List[str], filters: Dict[str, object], chunk_size: int = 100_000
+def build_detail_workbook(
+    summary_df: pd.DataFrame,
+    detail_paths: List[str],
+    detail_filters: Dict[str, object],
+    chunk_size: int = 100_000,
 ) -> bytes:
-    """Read detail CSVs in chunks, apply filters, and return the concatenated CSV bytes."""
+    """Produce an Excel workbook with summary and detail sheets."""
 
-    output_buffer = io.StringIO()
-    header_written = False
-    total_rows = 0
+    if summary_df.empty:
+        raise ValueError("No summary rows available to include in the workbook.")
 
-    for path_str in csv_paths:
+    buffer = io.BytesIO()
+    workbook = xlsxwriter.Workbook(buffer, {"in_memory": True})
+    summary_sheet = workbook.add_worksheet("Summary")
+    detail_sheet = workbook.add_worksheet("Detail")
+
+    _write_dataframe(summary_sheet, summary_df)
+
+    detail_header_written = False
+    detail_row_idx = 1
+    detail_rows_found = 0
+
+    for path_str in detail_paths:
         csv_path = Path(path_str)
         if not csv_path.exists():
             continue
@@ -520,23 +538,26 @@ def stream_filtered_detail_csv(
             if "TRANSACTION DATE" in chunk.columns:
                 chunk["TRANSACTION DATE"] = _parse_dates(chunk["TRANSACTION DATE"])
 
-            subset = apply_filters(chunk, filters, "Detail")
+            subset = apply_filters(chunk, detail_filters, "Detail")
             if subset.empty:
                 continue
 
-            subset.to_csv(
-                output_buffer,
-                index=False,
-                header=not header_written,
-                mode="a",
-            )
-            header_written = True
-            total_rows += len(subset)
+            if not detail_header_written:
+                detail_sheet.write_row(0, 0, list(subset.columns))
+                detail_header_written = True
 
-    if total_rows == 0:
+            for row in subset.itertuples(index=False, name=None):
+                detail_sheet.write_row(detail_row_idx, 0, row)
+                detail_row_idx += 1
+            detail_rows_found += len(subset)
+
+    if detail_rows_found == 0:
+        workbook.close()
         raise ValueError("No detail rows match the current filters.")
 
-    return output_buffer.getvalue().encode("utf-8")
+    workbook.close()
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 def _iter_csv_chunks(csv_path: Path, chunk_size: int) -> Iterable[pd.DataFrame]:
@@ -566,9 +587,12 @@ def _iter_csv_chunks(csv_path: Path, chunk_size: int) -> Iterable[pd.DataFrame]:
 
 
 def render_detail_download_sidebar(
-    all_files: List[FileMeta], selected_years: List[int], filters: Dict[str, object]
+    all_files: List[FileMeta],
+    selected_years: List[int],
+    filters: Dict[str, object],
+    summary_df: pd.DataFrame,
 ) -> None:
-    expander = st.sidebar.expander("Detailed summary download", expanded=False)
+    expander = st.sidebar.expander("Detailed summary workbook", expanded=False)
     with expander:
         if not selected_years:
             st.info("Select at least one reporting year to enable detailed downloads.")
@@ -581,8 +605,16 @@ def render_detail_download_sidebar(
             st.info("No detail files available for the selected years.")
             return
 
-        if not st.button("Prepare detailed summary CSV", key="detail_download_prepare"):
-            st.caption("Click to generate a CSV of detail records matching your filters.")
+        if summary_df.empty:
+            st.info("Generate the summary view first to enable workbook downloads.")
+            return
+
+        if xlsxwriter is None:
+            st.warning("Install 'xlsxwriter' to enable workbook downloads.")
+            return
+
+        if not st.button("Prepare detailed summary workbook", key="detail_download_prepare"):
+            st.caption("Click to generate an Excel workbook containing summary and detail sheets.")
             return
 
         detail_paths = [str(meta.path) for meta in detail_files]
@@ -590,16 +622,16 @@ def render_detail_download_sidebar(
         detail_filters["amount_column"] = "AMOUNT"
 
         try:
-            csv_bytes = stream_filtered_detail_csv(detail_paths, detail_filters)
+            workbook_bytes = build_detail_workbook(summary_df, detail_paths, detail_filters)
         except ValueError as exc:
             st.info(str(exc))
             return
 
         st.download_button(
-            "Download detailed summary",
-            data=csv_bytes,
-            file_name="sod_detail_filtered.csv",
-            mime="text/csv",
+            "Download detailed summary workbook",
+            data=workbook_bytes,
+            file_name="sod_detail_summary.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="detail_download_link",
         )
 
@@ -675,8 +707,14 @@ def main() -> None:
         render_summary_view(filtered_df, amount_column)
 
     render_data_preview(filtered_df)
-    render_detail_download_sidebar(files, selected_years, filters)
+    render_detail_download_sidebar(files, selected_years, filters, filtered_df if data_type == "Summary" else pd.DataFrame())
 
 
 if __name__ == "__main__":
     main()
+def _write_dataframe(sheet, df: pd.DataFrame) -> None:
+    """Write a DataFrame to an xlsxwriter worksheet."""
+
+    sheet.write_row(0, 0, list(df.columns))
+    for row_idx, row in enumerate(df.itertuples(index=False, name=None), start=1):
+        sheet.write_row(row_idx, 0, row)
