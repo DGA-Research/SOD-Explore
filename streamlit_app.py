@@ -42,6 +42,10 @@ QUARTER_TOKENS: List[Tuple[str, Tuple[str, str]]] = [
 
 QUARTER_SORT_ORDER = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4}
 DATE_FORMATS = ("%d-%b-%y", "%d-%b-%Y", "%m/%d/%Y")
+PERSON_PREFIX_PATTERN = re.compile(
+    r"^(THE\s+HONORABLE|THE\s+HON\.|HONORABLE|HON\.?|REPRESENTATIVE|REP\.?|SENATOR|SEN\.?|DELEGATE|DEL\.?|RESIDENT\s+COMMISSIONER)\s+",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -147,6 +151,43 @@ def _parse_dates(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce")
 
 
+def extract_person_name(value: object) -> Optional[str]:
+    """Extract the member name (if present) from an organization label."""
+
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    text = re.sub(r"^\d{4}\s+", "", text)  # drop leading year tokens
+    text = text.strip(" ,.-")
+    if not text:
+        return None
+
+    match = PERSON_PREFIX_PATTERN.match(text)
+    if not match:
+        return None
+
+    text = PERSON_PREFIX_PATTERN.sub("", text)
+    text = text.strip(" ,.-")
+    if not text:
+        return None
+
+    # Remove extra descriptors following punctuation.
+    for splitter in (",", " - ", " – ", "("):
+        if splitter in text:
+            text = text.split(splitter, 1)[0].strip()
+
+    if not text:
+        return None
+
+    name = " ".join(text.split())
+    name = name.upper()
+    # Filter out overly short strings (e.g., accidental single tokens).
+    if len(name) < 3 or " " not in name:
+        return None
+    return name
+
+
 @st.cache_data(show_spinner=True)
 def load_data(file_paths: Tuple[str, ...], data_type: str) -> pd.DataFrame:
     if not file_paths:
@@ -160,6 +201,8 @@ def load_data(file_paths: Tuple[str, ...], data_type: str) -> pd.DataFrame:
         df = _read_csv_with_fallback(csv_path)
         df.columns = [col.strip().upper() for col in df.columns]
         df["SOURCE_FILE"] = csv_path.name
+        if "ORGANIZATION" in df.columns and "PERSON" not in df.columns:
+            df["PERSON"] = df["ORGANIZATION"].apply(extract_person_name)
 
         if data_type == "Detail" and "AMOUNT" in df.columns:
             df["AMOUNT"] = _to_numeric(df["AMOUNT"])
@@ -247,6 +290,10 @@ def build_filter_controls(df: pd.DataFrame, data_type: str) -> Dict[str, object]
             options = sorted(df[column_label].dropna().unique())
             filters[filter_key] = st.sidebar.multiselect(column_label.title(), options=options)
 
+    if "PERSON" in df.columns and df["PERSON"].notna().any():
+        person_options = sorted(df["PERSON"].dropna().unique())
+        filters["person"] = st.sidebar.multiselect("Person", options=person_options)
+
     if data_type == "Detail" and "VENDOR NAME" in df.columns:
         filters["vendor_query"] = st.sidebar.text_input("Vendor contains")
 
@@ -297,6 +344,7 @@ def apply_filters(df: pd.DataFrame, filters: Dict[str, object], data_type: str) 
         "program": "PROGRAM",
         "boc": "BUDGET OBJECT CLASS",
         "boc_code": "BUDGET OBJECT CODE",
+        "person": "PERSON",
     }
     for key, column in column_map.items():
         values = filters.get(key)
