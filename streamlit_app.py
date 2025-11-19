@@ -1,0 +1,398 @@
+"""
+Streamlit application for exploring U.S. House Statement of Disbursements (SOD) CSV files.
+
+The app scans the local ``SOD_Bulk`` folder, lets users choose which detail/summary files to
+load, exposes sidebar filters, and visualizes the filtered slice. Launch with:
+
+    streamlit run streamlit_app.py
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+import streamlit as st
+
+# Default location that ships with the repository.
+DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "SOD_Bulk"
+
+# Tokens that help infer reporting quarter from a file name.
+QUARTER_TOKENS: List[Tuple[str, Tuple[str, str]]] = [
+    ("JAN-MAR", ("Q1", "Jan–Mar")),
+    ("JANUARY-MARCH", ("Q1", "Jan–Mar")),
+    ("JAN_MAR", ("Q1", "Jan–Mar")),
+    ("APR-JUN", ("Q2", "Apr–Jun")),
+    ("APRIL-JUNE", ("Q2", "Apr–Jun")),
+    ("APR-JUNE", ("Q2", "Apr–Jun")),
+    ("APR_JUN", ("Q2", "Apr–Jun")),
+    ("JUL-SEP", ("Q3", "Jul–Sep")),
+    ("JUL-SEPT", ("Q3", "Jul–Sep")),
+    ("JULY-SEPT", ("Q3", "Jul–Sep")),
+    ("JULY-SEPTEMBER", ("Q3", "Jul–Sep")),
+    ("JUL-SEPTEMBER", ("Q3", "Jul–Sep")),
+    ("OCT-DEC", ("Q4", "Oct–Dec")),
+    ("OCTOBER-DECEMBER", ("Q4", "Oct–Dec")),
+    ("OCT-DECEMBER", ("Q4", "Oct–Dec")),
+]
+
+QUARTER_SORT_ORDER = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4}
+
+
+@dataclass
+class FileMeta:
+    """Metadata about one CSV file on disk."""
+
+    path: Path
+    data_type: str  # Detail or Summary
+    year: Optional[int]
+    quarter: Optional[str]
+    quarter_label: Optional[str]
+
+    @property
+    def label(self) -> str:
+        year_txt = str(self.year) if self.year else "Year ?"
+        quarter_txt = self.quarter_label or "Quarter ?"
+        return f"{year_txt} {quarter_txt} • {self.data_type} • {self.path.name}"
+
+    @property
+    def sort_key(self) -> Tuple[int, int, str]:
+        year_val = self.year or 0
+        quarter_val = QUARTER_SORT_ORDER.get(self.quarter or "", 0)
+        return (year_val, quarter_val, self.path.name)
+
+
+def normalize_name(name: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "-", name.upper())
+
+
+def infer_quarter_bits(name: str) -> Tuple[Optional[str], Optional[str]]:
+    normalized = normalize_name(name)
+    for token, (quarter_code, quarter_label) in QUARTER_TOKENS:
+        if token in normalized:
+            return quarter_code, quarter_label
+    return None, None
+
+
+def infer_data_type(name: str) -> str:
+    normalized = normalize_name(name)
+    if "SUMMARY" in normalized or "SUMM" in normalized:
+        return "Summary"
+    return "Detail"
+
+
+def infer_year(name: str) -> Optional[int]:
+    match = re.search(r"(20\d{2}|19\d{2})", name)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def discover_files(data_dir_str: str) -> List[FileMeta]:
+    data_dir = Path(data_dir_str)
+    if not data_dir.exists():
+        return []
+
+    files: List[FileMeta] = []
+    for csv_path in sorted(data_dir.glob("*.csv")):
+        year = infer_year(csv_path.name)
+        quarter_code, quarter_label = infer_quarter_bits(csv_path.name)
+        data_type = infer_data_type(csv_path.name)
+        files.append(
+            FileMeta(
+                path=csv_path,
+                data_type=data_type,
+                year=year,
+                quarter=quarter_code,
+                quarter_label=quarter_label,
+            )
+        )
+    return sorted(files, key=lambda meta: meta.sort_key)
+
+
+def _to_numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce")
+
+
+@st.cache_data(show_spinner=True)
+def load_data(file_paths: Tuple[str, ...], data_type: str) -> pd.DataFrame:
+    if not file_paths:
+        return pd.DataFrame()
+
+    frames: List[pd.DataFrame] = []
+    for path_str in file_paths:
+        csv_path = Path(path_str)
+        if not csv_path.exists():
+            continue
+        df = pd.read_csv(csv_path)
+        df.columns = [col.strip().upper() for col in df.columns]
+        df["SOURCE_FILE"] = csv_path.name
+
+        if data_type == "Detail" and "AMOUNT" in df.columns:
+            df["AMOUNT"] = _to_numeric(df["AMOUNT"])
+            for date_col in ("TRANSACTION DATE", "PERFORM START DT", "PERFORM END DT"):
+                if date_col in df.columns:
+                    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        else:
+            for value_col in ("QTD AMOUNT", "YTD AMOUNT"):
+                if value_col in df.columns:
+                    df[value_col] = _to_numeric(df[value_col])
+
+        frames.append(df)
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def sidebar_dataset_picker(files: List[FileMeta]) -> Tuple[str, List[FileMeta]]:
+    st.sidebar.header("Dataset")
+
+    data_type = st.sidebar.selectbox("Data type", options=["Detail", "Summary"])
+    filtered = [meta for meta in files if meta.data_type == data_type]
+    if not filtered:
+        st.sidebar.info(f"No {data_type.lower()} files found in the data folder.")
+        return data_type, []
+
+    period_options = {meta.label: meta for meta in filtered}
+    default_selection = [filtered[-1].label] if filtered else []
+    selected_labels = st.sidebar.multiselect(
+        "Reporting periods", options=list(period_options.keys()), default=default_selection
+    )
+    selected_files = [period_options[label] for label in selected_labels]
+
+    st.sidebar.caption("Tip: limit selections if you run into memory constraints.")
+    return data_type, selected_files
+
+
+def build_filter_controls(df: pd.DataFrame, data_type: str) -> Dict[str, object]:
+    filters: Dict[str, object] = {}
+    if df.empty:
+        return filters
+
+    st.sidebar.header("Filters")
+
+    for column_label, filter_key in (
+        ("ORGANIZATION", "organization"),
+        ("PROGRAM", "program"),
+        ("BUDGET OBJECT CLASS", "boc"),
+        ("BUDGET OBJECT CODE", "boc_code"),
+    ):
+        if column_label in df.columns:
+            options = sorted(df[column_label].dropna().unique())
+            filters[filter_key] = st.sidebar.multiselect(column_label.title(), options=options)
+
+    if data_type == "Detail" and "VENDOR NAME" in df.columns:
+        filters["vendor_query"] = st.sidebar.text_input("Vendor contains")
+
+    amount_column = "AMOUNT" if data_type == "Detail" else None
+    if data_type == "Summary":
+        available_value_cols = [col for col in ("QTD AMOUNT", "YTD AMOUNT") if col in df.columns]
+        if available_value_cols:
+            amount_column = st.sidebar.selectbox(
+                "Value column",
+                options=available_value_cols,
+                format_func=lambda col: "Quarter-to-date" if col.startswith("QTD") else "Year-to-date",
+            )
+
+    filters["amount_column"] = amount_column
+    if amount_column and amount_column in df.columns:
+        cleaned = df[amount_column].dropna()
+        if not cleaned.empty:
+            min_val = float(cleaned.min())
+            max_val = float(cleaned.max())
+            if min_val == max_val:
+                max_val = min_val + 1.0
+            filters["amount_range"] = st.sidebar.slider(
+                "Amount range",
+                min_value=float(min_val),
+                max_value=float(max_val),
+                value=(float(min_val), float(max_val)),
+                step=float(max(1.0, (max_val - min_val) / 100)),
+            )
+
+    if data_type == "Detail" and "TRANSACTION DATE" in df.columns:
+        date_series = df["TRANSACTION DATE"].dropna()
+        if not date_series.empty:
+            min_date = date_series.min().date()
+            max_date = date_series.max().date()
+            filters["transaction_dates"] = st.sidebar.date_input(
+                "Transaction date range",
+                value=(min_date, max_date),
+            )
+
+    return filters
+
+
+def apply_filters(df: pd.DataFrame, filters: Dict[str, object], data_type: str) -> pd.DataFrame:
+    filtered = df.copy()
+
+    column_map = {
+        "organization": "ORGANIZATION",
+        "program": "PROGRAM",
+        "boc": "BUDGET OBJECT CLASS",
+        "boc_code": "BUDGET OBJECT CODE",
+    }
+    for key, column in column_map.items():
+        values = filters.get(key)
+        if values:
+            filtered = filtered[filtered[column].isin(values)]
+
+    vendor_query = filters.get("vendor_query")
+    if vendor_query and "VENDOR NAME" in filtered.columns:
+        filtered = filtered[
+            filtered["VENDOR NAME"].str.contains(vendor_query, case=False, na=False)
+        ]
+
+    amount_column = filters.get("amount_column")
+    amount_range = filters.get("amount_range")
+    if amount_column and amount_range and amount_column in filtered.columns:
+        min_amount, max_amount = amount_range
+        filtered = filtered[
+            (filtered[amount_column] >= float(min_amount))
+            & (filtered[amount_column] <= float(max_amount))
+        ]
+
+    if data_type == "Detail" and "TRANSACTION DATE" in filtered.columns:
+        date_range = filters.get("transaction_dates")
+        if date_range and len(date_range) == 2:
+            start_date, end_date = date_range
+            start_ts = pd.to_datetime(start_date)
+            end_ts = pd.to_datetime(end_date)
+            filtered = filtered[
+                (filtered["TRANSACTION DATE"] >= start_ts)
+                & (filtered["TRANSACTION DATE"] <= end_ts)
+            ]
+
+    return filtered
+
+
+def render_detail_view(df: pd.DataFrame) -> None:
+    if df.empty:
+        st.info("No detail records match the current filters.")
+        return
+
+    total_amount = df["AMOUNT"].sum()
+    median_amount = df["AMOUNT"].median()
+    unique_vendors = df.get("VENDOR NAME", pd.Series(dtype=str)).nunique(dropna=True)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total spend (filtered)", f"${total_amount:,.0f}")
+    c2.metric("Median transaction", f"${median_amount:,.0f}")
+    c3.metric("Unique vendors", f"{unique_vendors:,}")
+
+    st.subheader("Top organizations")
+    org_totals = (
+        df.groupby("ORGANIZATION")["AMOUNT"].sum().sort_values(ascending=False).head(10)
+    )
+    st.bar_chart(org_totals)
+
+    if "VENDOR NAME" in df.columns:
+        st.subheader("Top vendors")
+        vendor_totals = (
+            df.groupby("VENDOR NAME")["AMOUNT"]
+            .sum()
+            .sort_values(ascending=False)
+            .head(10)
+            .rename("Total Amount")
+        )
+        st.dataframe(vendor_totals)
+
+
+def render_summary_view(df: pd.DataFrame, amount_column: Optional[str]) -> None:
+    if df.empty:
+        st.info("No summary rows match the current filters.")
+        return
+
+    amount_column = amount_column or "QTD AMOUNT"
+    if amount_column not in df.columns:
+        amount_column = df.columns[-1]
+
+    total_value = df[amount_column].sum()
+    avg_value = df[amount_column].mean()
+    unique_programs = df.get("PROGRAM", pd.Series(dtype=str)).nunique(dropna=True)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Aggregate value", f"${total_value:,.0f}")
+    c2.metric("Mean row value", f"${avg_value:,.0f}")
+    c3.metric("Programs represented", f"{unique_programs:,}")
+
+    st.subheader("Top descriptions")
+    top_desc = (
+        df.groupby("DESCRIPTION")[amount_column]
+            .sum()
+            .sort_values(ascending=False)
+            .head(10)
+            .rename("Total")
+    )
+    st.dataframe(top_desc)
+
+    st.subheader("Organizations by value")
+    org_chart = (
+        df.groupby("ORGANIZATION")[amount_column]
+        .sum()
+        .sort_values(ascending=False)
+        .head(10)
+    )
+    st.bar_chart(org_chart)
+
+
+def render_data_preview(df: pd.DataFrame) -> None:
+    st.subheader("Filtered rows")
+    st.caption(f"{len(df):,} rows displayed (showing first 1,000).")
+    st.dataframe(df.head(1000))
+
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download filtered CSV",
+        data=csv_bytes,
+        file_name="sod_filtered.csv",
+        mime="text/csv",
+    )
+
+
+def main() -> None:
+    st.set_page_config(page_title="SOD Explorer", layout="wide")
+    st.title("Statement of Disbursements Explorer")
+    st.caption("Interactively analyze SOD summary/detail CSV files with custom filters.")
+
+    data_dir_input = st.sidebar.text_input(
+        "SOD data folder", value=str(DEFAULT_DATA_DIR), help="Path containing the raw CSV files."
+    )
+    files = discover_files(data_dir_input)
+
+    if not files:
+        st.error("No CSV files detected. Confirm the folder path and retry.")
+        st.stop()
+
+    data_type, selected_files = sidebar_dataset_picker(files)
+    if not selected_files:
+        st.warning("Pick at least one reporting period to begin exploring the data.")
+        st.stop()
+
+    selected_paths = tuple(str(meta.path) for meta in selected_files)
+    with st.spinner("Loading CSV files…"):
+        df = load_data(selected_paths, data_type)
+
+    if df.empty:
+        st.error("The selected files could not be loaded or contain no rows.")
+        st.stop()
+
+    filters = build_filter_controls(df, data_type)
+    filtered_df = apply_filters(df, filters, data_type)
+
+    amount_column = filters.get("amount_column")
+    if data_type == "Detail":
+        render_detail_view(filtered_df)
+    else:
+        render_summary_view(filtered_df, amount_column)
+
+    render_data_preview(filtered_df)
+
+
+if __name__ == "__main__":
+    main()
