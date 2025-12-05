@@ -31,6 +31,7 @@ DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "SOD_Bulk"
 # Limit for how many categorical options we surface as multiselects before
 # falling back to text queries to avoid rendering massive lists.
 SIDEBAR_OPTION_LIMIT = 500
+CUSTOM_GCS_OPTION_LABEL = "Custom input"
 
 # Tokens that help infer reporting quarter from a file name.
 QUARTER_TOKENS: List[Tuple[str, Tuple[str, str]]] = [
@@ -76,6 +77,31 @@ def _path_exists(path_str: str) -> bool:
     if _is_remote_path(path_str):
         return True
     return Path(path_str).exists()
+
+
+def _get_secret_dict(key: str) -> Dict[str, Dict[str, object]]:
+    try:
+        value = st.secrets.get(key)  # type: ignore[attr-defined]
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def get_configured_gcs_sources() -> Dict[str, Dict[str, str]]:
+    sources = _get_secret_dict("gcs_sources")
+    normalized: Dict[str, Dict[str, str]] = {}
+    for name, config in sources.items():
+        if not isinstance(config, dict):
+            continue
+        bucket = str(config.get("bucket", "")).strip()
+        if not bucket:
+            continue
+        normalized[name] = {
+            "bucket": bucket,
+            "prefix": str(config.get("prefix", "") or "").strip(),
+            "service_account_json": str(config.get("service_account_json", "") or "").strip(),
+        }
+    return normalized
 
 
 @dataclass
@@ -768,26 +794,44 @@ def main() -> None:
             st.stop()
         files = discover_local_files(str(data_dir))
     else:
-        gcs_bucket = st.sidebar.text_input("GCS bucket", value="", help="Example: my-bucket-name")
+        configured_sources = get_configured_gcs_sources()
+        selected_profile: Optional[str] = None
+        profile_defaults: Dict[str, str] = {}
+        if configured_sources:
+            options = list(configured_sources.keys())
+            if CUSTOM_GCS_OPTION_LABEL not in options:
+                options.append(CUSTOM_GCS_OPTION_LABEL)
+            selected_option = st.sidebar.selectbox(
+                "Configured GCS source", options, index=0
+            )
+            if selected_option != CUSTOM_GCS_OPTION_LABEL:
+                selected_profile = selected_option
+                profile_defaults = configured_sources[selected_profile]
+        gcs_bucket = st.sidebar.text_input(
+            "GCS bucket",
+            value=profile_defaults.get("bucket", ""),
+            help="Example: my-bucket-name or gs://my-bucket.",
+        )
         gcs_prefix = st.sidebar.text_input(
             "Object prefix (optional)",
-            value="",
-            help="Example: sod/detail/2024_Q1/",
+            value=profile_defaults.get("prefix", ""),
+            help="Example: sod/detail/2024_Q1/ — leave empty for the whole bucket.",
         )
         service_account_input = st.sidebar.text_area(
             "Service account JSON (optional)",
-            value="",
+            value=profile_defaults.get("service_account_json", ""),
             height=120,
             help="Leave blank to use Application Default Credentials or a gcp_service_account secret.",
         )
         service_account_json = service_account_input.strip() or None
-        try:
-            secret_account = st.secrets.get("gcp_service_account")  # type: ignore[attr-defined]
-        except Exception:  # pragma: no cover - secrets unavailable locally
-            secret_account = None
-        if not service_account_json and secret_account:
-            service_account_json = json.dumps(secret_account)
-            st.sidebar.caption("Using gcp_service_account from Streamlit secrets.")
+        if not service_account_json:
+            try:
+                secret_account = st.secrets.get("gcp_service_account")  # type: ignore[attr-defined]
+            except Exception:  # pragma: no cover - secrets unavailable locally
+                secret_account = None
+            if secret_account:
+                service_account_json = json.dumps(secret_account)
+                st.sidebar.caption("Using gcp_service_account from Streamlit secrets.")
         files = discover_gcs_files(gcs_bucket, gcs_prefix, service_account_json)
 
     if not files:
