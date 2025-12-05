@@ -31,7 +31,13 @@ DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "SOD_Bulk"
 # Limit for how many categorical options we surface as multiselects before
 # falling back to text queries to avoid rendering massive lists.
 SIDEBAR_OPTION_LIMIT = 500
-CUSTOM_GCS_OPTION_LABEL = "Custom input"
+
+# Default remote profile used when no secrets-based entry exists.
+DEFAULT_GCS_PROFILE = {
+    "bucket": "my-prod-bucket",
+    "prefix": "sod/detail/",
+    "service_account_json": None,
+}
 
 # Tokens that help infer reporting quarter from a file name.
 QUARTER_TOKENS: List[Tuple[str, Tuple[str, str]]] = [
@@ -102,6 +108,17 @@ def _serialize_secret_mapping(secret_obj: object) -> Optional[str]:
         return None
 
 
+def resolve_service_account_json(explicit_json: Optional[str]) -> Optional[str]:
+    explicit = (explicit_json or "").strip()
+    if explicit:
+        return explicit
+    try:
+        secret_account = st.secrets.get("gcp_service_account")  # type: ignore[attr-defined]
+    except Exception:
+        secret_account = None
+    return _serialize_secret_mapping(secret_account)
+
+
 def get_configured_gcs_sources() -> Dict[str, Dict[str, str]]:
     sources = _get_secret_dict("gcs_sources")
     normalized: Dict[str, Dict[str, str]] = {}
@@ -118,6 +135,14 @@ def get_configured_gcs_sources() -> Dict[str, Dict[str, str]]:
             "service_account_json": (_serialize_secret_mapping(sa_value) or "").strip(),
         }
     return normalized
+
+
+def get_preloaded_gcs_profile() -> Dict[str, Optional[str]]:
+    configured = get_configured_gcs_sources()
+    if configured:
+        first_key = sorted(configured.keys())[0]
+        return configured[first_key]
+    return DEFAULT_GCS_PROFILE
 
 
 @dataclass
@@ -810,44 +835,25 @@ def main() -> None:
             st.stop()
         files = discover_local_files(str(data_dir))
     else:
-        configured_sources = get_configured_gcs_sources()
-        selected_profile: Optional[str] = None
-        profile_defaults: Dict[str, str] = {}
-        if configured_sources:
-            options = list(configured_sources.keys())
-            if CUSTOM_GCS_OPTION_LABEL not in options:
-                options.append(CUSTOM_GCS_OPTION_LABEL)
-            selected_option = st.sidebar.selectbox(
-                "Configured GCS source", options, index=0
+        profile = get_preloaded_gcs_profile()
+        gcs_bucket = (profile.get("bucket") or "").strip()
+        gcs_prefix = (profile.get("prefix") or "").strip()
+        service_account_json = resolve_service_account_json(profile.get("service_account_json"))
+
+        if not gcs_bucket:
+            st.error(
+                "No preloaded GCS bucket configured. Update DEFAULT_GCS_PROFILE or add an entry "
+                "under [gcs_sources] in Streamlit secrets."
             )
-            if selected_option != CUSTOM_GCS_OPTION_LABEL:
-                selected_profile = selected_option
-                profile_defaults = configured_sources[selected_profile]
-        gcs_bucket = st.sidebar.text_input(
-            "GCS bucket",
-            value=profile_defaults.get("bucket", ""),
-            help="Example: my-bucket-name or gs://my-bucket.",
-        )
-        gcs_prefix = st.sidebar.text_input(
-            "Object prefix (optional)",
-            value=profile_defaults.get("prefix", ""),
-            help="Example: sod/detail/2024_Q1/ — leave empty for the whole bucket.",
-        )
-        service_account_input = st.sidebar.text_area(
-            "Service account JSON (optional)",
-            value=profile_defaults.get("service_account_json", ""),
-            height=120,
-            help="Leave blank to use Application Default Credentials or a gcp_service_account secret.",
-        )
-        service_account_json = service_account_input.strip() or None
-        if not service_account_json:
-            try:
-                secret_account = st.secrets.get("gcp_service_account")  # type: ignore[attr-defined]
-            except Exception:  # pragma: no cover - secrets unavailable locally
-                secret_account = None
-            service_account_json = _serialize_secret_mapping(secret_account)
-            if service_account_json:
-                st.sidebar.caption("Using gcp_service_account from Streamlit secrets.")
+            st.stop()
+
+        prefix_label = gcs_prefix or "(entire bucket)"
+        st.sidebar.success(f"Using GCS bucket: {gcs_bucket}\nPrefix: {prefix_label}")
+        if service_account_json:
+            st.sidebar.caption("Service account credentials loaded automatically.")
+        else:
+            st.sidebar.warning("No service account JSON detected; relying on default credentials.")
+
         files = discover_gcs_files(gcs_bucket, gcs_prefix, service_account_json)
 
     if not files:
